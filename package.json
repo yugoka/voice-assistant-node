@@ -9,7 +9,9 @@
   "license": "MIT",
   "description": "",
   "dependencies": {
+    "dotenv": "^16.4.5",
     "mic": "^2.1.2",
+    "node-record-lpcm16": "^1.0.1",
     "speaker": "^0.5.5",
     "uuid": "^11.0.3",
     "ws": "^8.18.0"
