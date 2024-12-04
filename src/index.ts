@@ -346,14 +346,14 @@ class RealtimeChat {
     }
 
     const query = lastUserMessage.content;
-    console.log(query);
+    console.log(`ツール検索クエリ: ${query}`);
 
     // ツール検索APIを呼び出す
     const apiUrl =
       process.env.ASSISTANT_HUB_BASE_URL ||
       "https://assistant-hub-zeta.vercel.app";
     const searchEndpoint = `${apiUrl}/api/tools/search`;
-    console.log(searchEndpoint);
+    console.log(`ツール検索エンドポイント: ${searchEndpoint}`);
 
     const apiKey = process.env.ASSISTANT_HUB_API_KEY;
 
@@ -521,6 +521,11 @@ class RealtimeChat {
     }
 
     const toolId = toolInfo.baseTool.id;
+
+    // ログに動的ツールの呼び出しを表示
+    console.log(
+      `動的ツールが呼び出されました: ${functionName} - ${toolInfo.baseTool.description}`
+    );
 
     // ツール実行APIを呼び出す
     const apiUrl =
@@ -754,24 +759,30 @@ class RealtimeChat {
     const audioDeltaBase64 = event.delta;
     const audioDelta = Buffer.from(audioDeltaBase64, "base64");
 
-    if (!this.audioStream) {
+    // 音声再生が開始されていない場合は初期化
+    if (!this.isPlayingAudio) {
+      this.isPlayingAudio = true;
+
+      // 新たにPassThroughストリームを作成
       this.audioStream = new PassThrough();
 
+      // スピーカーインスタンスを作成
       this.speakerInstance = new Speaker({
         channels: 1,
         bitDepth: 16,
         sampleRate: 24000,
       });
 
-      this.isPlayingAudio = true;
+      // ストリームをスピーカーにパイプ
+      this.audioStream.pipe(this.speakerInstance);
 
+      // ストリームのデータイベントで音声データの長さを計測
       this.audioStream.on("data", (chunk: Buffer) => {
         const chunkDurationMs = (chunk.length / 2 / 24000) * 1000;
         this.assistantAudioPlaybackDurationMs += chunkDurationMs;
       });
 
-      this.audioStream.pipe(this.speakerInstance);
-
+      // スピーカーの終了イベント
       this.speakerInstance.on("close", () => {
         this.isPlayingAudio = false;
         this.speakerInstance = null;
@@ -779,6 +790,7 @@ class RealtimeChat {
         this.startInactivityTimer();
       });
 
+      // スピーカーのエラーイベント
       this.speakerInstance.on("error", (err) => {
         console.error("Speakerエラー:", err);
         this.isPlayingAudio = false;
@@ -788,11 +800,10 @@ class RealtimeChat {
       });
     }
 
-    if (!this.isPlayingAudio || !this.audioStream || !this.speakerInstance) {
-      return;
+    // オーディオデータをストリームに書き込む
+    if (this.audioStream && this.speakerInstance) {
+      this.audioStream.write(audioDelta);
     }
-
-    this.audioStream.write(audioDelta);
 
     const deltaBytes = audioDelta.length;
     const deltaDurationMs = (deltaBytes / 2 / 24000) * 1000;
@@ -803,7 +814,7 @@ class RealtimeChat {
   private handleResponseAudioDone(event: any) {
     this.audioDone = true; // 音声データの受信完了を設定
     if (this.audioStream) {
-      this.audioStream.end();
+      this.audioStream.end(); // ストリームを終了
     }
   }
 
@@ -893,13 +904,12 @@ class RealtimeChat {
     this.audioDone = true; // 受信完了を設定
 
     if (this.audioStream) {
-      this.audioStream.unpipe();
-      this.audioStream.end();
+      this.audioStream.end(); // ストリームを終了
       this.audioStream = null;
     }
 
     if (this.speakerInstance) {
-      this.speakerInstance.end();
+      this.speakerInstance.end(); // スピーカーを終了
       this.speakerInstance = null;
     }
 
