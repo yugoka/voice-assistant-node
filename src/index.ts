@@ -49,10 +49,13 @@ class RealtimeChat {
   private dynamicTools: Map<string, ToolSearchApiResponse>;
   private pendingFunctionCalls: Map<string, Function>;
 
+  // 新しく追加した変数: 最後にログを出力したメッセージのインデックス
+  private lastLoggedIndex: number;
+
   constructor(options?: { threadId?: string }) {
     // 設定
     this.OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
-    this.MODEL_NAME = "gpt-4o-realtime-preview-2024-10-01";
+    this.MODEL_NAME = "gpt-4o-realtime-preview";
     this.threadId = options?.threadId || process.env.ASSISTANT_HUB_THREAD_ID!;
 
     // 状態変数の初期化
@@ -113,6 +116,9 @@ class RealtimeChat {
     this.dynamicTools = new Map<string, ToolSearchApiResponse>();
     // ペンディング中の関数呼び出しを管理するマップ
     this.pendingFunctionCalls = new Map<string, Function>();
+
+    // 最後にログを出力したインデックスの初期化
+    this.lastLoggedIndex = 0;
   }
 
   // イベントIDを生成
@@ -150,6 +156,7 @@ class RealtimeChat {
   private async setupSession() {
     const settings = await this.getInitialSettings();
     const instructions = `${settings.system_prompt}\n\n${settings.memory}`;
+    console.log(instructions);
 
     const functionsList: FunctionDef[] = [updateToolListFunction];
 
@@ -297,6 +304,11 @@ class RealtimeChat {
         content: "",
         item_id: item.id,
       });
+
+      // 新しいメッセージをログに出力
+      this.logNewMessage(
+        this.conversationHistory[this.conversationHistory.length - 1]
+      );
     } else if (item.role === "user") {
       this.resetInactivityTimer();
       // ユーザーメッセージを会話履歴に追加（内容はまだ空）
@@ -305,6 +317,11 @@ class RealtimeChat {
         content: "",
         item_id: item.id,
       });
+
+      // 新しいメッセージをログに出力
+      this.logNewMessage(
+        this.conversationHistory[this.conversationHistory.length - 1]
+      );
     }
   }
 
@@ -327,16 +344,21 @@ class RealtimeChat {
       item_id: item.id,
     });
 
+    // 新しいメッセージをログに出力
+    this.logNewMessage(
+      this.conversationHistory[this.conversationHistory.length - 1]
+    );
+
     if (functionName === "update_tools_list") {
       // ユーザーの最新の入力が利用可能か確認
-      const lastUserMessage = this.getLastUserMessage();
-      if (lastUserMessage && lastUserMessage.content) {
+      const lastMessages = this.getLastNMessages(5);
+      if (lastMessages.length > 0) {
         // ユーザー入力がすでに利用可能
-        await this.handleUpdateToolsList(callId);
+        await this.handleUpdateToolsList(callId, lastMessages);
       } else {
         // ユーザー入力がまだ利用できないので、ペンディングに追加
         this.pendingFunctionCalls.set(callId, async () => {
-          await this.handleUpdateToolsList(callId);
+          await this.handleUpdateToolsList(callId, this.getLastNMessages(5));
         });
       }
     } else {
@@ -348,28 +370,24 @@ class RealtimeChat {
     }
   }
 
-  // 最新のユーザーメッセージを取得
-  private getLastUserMessage() {
-    return this.conversationHistory
-      .slice()
-      .reverse()
-      .find((msg) => msg.role === "user");
+  // 最新のN件のメッセージを取得
+  private getLastNMessages(n: number): any[] {
+    return this.conversationHistory.slice(-n);
   }
 
   // update_tools_listを処理（axiosを使用）
-  private async handleUpdateToolsList(callId: string) {
-    // 最後のユーザーメッセージを取得
-    const lastUserMessage = this.getLastUserMessage();
+  private async handleUpdateToolsList(callId: string, lastMessages: any[]) {
+    // 最後のN件のメッセージを取得
+    const messages = lastMessages
+      .map((msg) => {
+        if (msg.role === "user" || msg.role === "assistant") {
+          return msg.content;
+        }
+        return "";
+      })
+      .join("\n");
 
-    if (!lastUserMessage || !lastUserMessage.content) {
-      console.error(
-        "ツール検索クエリのためのユーザーメッセージが見つかりません。"
-      );
-      return;
-    }
-
-    const query = lastUserMessage.content;
-    console.log(`ツール検索クエリ: ${query}`);
+    console.log(`ツール更新のための会話履歴:\n${messages}`);
 
     // ツール検索APIを呼び出す
     const apiUrl =
@@ -384,7 +402,7 @@ class RealtimeChat {
       const response = await axios.post(
         searchEndpoint,
         {
-          query: query,
+          query: messages,
           openai_tools_mode: true,
         },
         {
@@ -451,6 +469,11 @@ class RealtimeChat {
         content: JSON.stringify(resultMessage),
         item_id: this.generateEventId(),
       });
+
+      // 新しいメッセージをログに出力
+      this.logNewMessage(
+        this.conversationHistory[this.conversationHistory.length - 1]
+      );
 
       // 関数呼び出しをペンディングリストから削除
       this.pendingFunctionCalls.delete(callId);
@@ -529,6 +552,11 @@ class RealtimeChat {
         item_id: this.generateEventId(),
       });
 
+      // 新しいメッセージをログに出力
+      this.logNewMessage(
+        this.conversationHistory[this.conversationHistory.length - 1]
+      );
+
       // 関数呼び出しをペンディングリストから削除
       this.pendingFunctionCalls.delete(callId);
 
@@ -598,6 +626,11 @@ class RealtimeChat {
         item_id: this.generateEventId(),
       });
 
+      // 新しいメッセージをログに出力
+      this.logNewMessage(
+        this.conversationHistory[this.conversationHistory.length - 1]
+      );
+
       // 関数呼び出しをペンディングリストから削除
       this.pendingFunctionCalls.delete(callId);
 
@@ -646,7 +679,10 @@ class RealtimeChat {
           item_id: itemId,
         });
       }
-      this.outputConversationLog();
+      // 新しいメッセージをログに出力
+      this.logNewMessage(
+        this.conversationHistory[this.conversationHistory.length - 1]
+      );
 
       // ペンディング中の関数呼び出しがあれば処理
       this.pendingFunctionCalls.forEach(async (func, pendingCallId) => {
@@ -727,7 +763,10 @@ class RealtimeChat {
           item_id: itemId,
         });
       }
-      this.outputConversationLog();
+      // 新しいメッセージをログに出力
+      this.logNewMessage(
+        this.conversationHistory[this.conversationHistory.length - 1]
+      );
     }
   }
 
@@ -765,6 +804,10 @@ class RealtimeChat {
           item_id: itemId,
         });
       }
+      // 新しいメッセージをログに出力
+      this.logNewMessage(
+        this.conversationHistory[this.conversationHistory.length - 1]
+      );
     }
   }
 
@@ -936,22 +979,21 @@ class RealtimeChat {
     this.startInactivityTimer();
   }
 
-  // 会話履歴を出力
-  private outputConversationLog() {
-    console.log("会話履歴:");
-    this.conversationHistory.forEach((item) => {
-      const role = item.role;
-      const content = item.content || "[No content]";
-      if (item.type === "function_call") {
-        console.log(
-          `${role}が関数 ${item.function_name} を呼び出しました。引数: ${content}`
-        );
-      } else if (item.type === "function_call_output") {
-        console.log(`関数 ${item.function_name} の戻り値: ${content}`);
-      } else {
-        console.log(`${role}: ${content}`);
-      }
-    });
+  // 会話履歴を出力（新しいメッセージのみ）
+  private logNewMessage(message: any) {
+    const role = message.role;
+    const content = message.content || "[No content]";
+    if (message.type === "function_call") {
+      console.log(
+        `${role}が関数 ${message.function_name} を呼び出しました。引数: ${content}`
+      );
+    } else if (message.type === "function_call_output") {
+      console.log(`関数 ${message.function_name} の戻り値: ${content}`);
+    } else {
+      console.log(`${role}: ${content}`);
+    }
+    // 最後にログを出力したインデックスを更新
+    this.lastLoggedIndex = this.conversationHistory.length;
   }
 
   // セッションのツールリストを更新
