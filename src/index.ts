@@ -3,15 +3,16 @@ import dotenv from "dotenv";
 import mic from "mic";
 import Speaker from "speaker";
 import { PassThrough } from "stream";
+import { Readable } from "stream";
 
 dotenv.config();
 
 class RealtimeChat {
   private OPENAI_API_KEY: string;
   private MODEL_NAME: string;
+
+  // 状態変数
   private conversationHistory: any[];
-  private ws: WebSocket;
-  private micInstance: any;
   private inactivityTimer: NodeJS.Timeout | null;
   private isPlayingAudio: boolean;
   private isAssistantResponding: boolean;
@@ -20,16 +21,29 @@ class RealtimeChat {
   private assistantAudioContentIndex: number | null;
   private assistantAudioDurationMs: number;
   private assistantAudioPlaybackDurationMs: number;
-  private eventCounter: number = 0;
+  private eventCounter: number;
   private conversationItems: Map<string, any>;
-  private speakerInstance: Speaker | null;
-  private audioStream: PassThrough | null;
   private truncatedAssistantItemIds: Set<string>;
   private functionCalls: Map<string, any>;
+  private audioDone: boolean;
+
+  // オーディオ関連
+  private micInstance: any;
+  private speakerInstance: Speaker | null;
+  private audioStream: PassThrough | null;
+  private audioStop: boolean;
+
+  // WebSocket
+  private ws: WebSocket;
+  private url: string;
+  private wsHeaders: any;
 
   constructor() {
+    // 設定
     this.OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
     this.MODEL_NAME = "gpt-4o-realtime-preview-2024-10-01";
+
+    // 状態変数の初期化
     this.conversationHistory = [];
     this.inactivityTimer = null;
     this.isPlayingAudio = false;
@@ -39,22 +53,31 @@ class RealtimeChat {
     this.assistantAudioContentIndex = null;
     this.assistantAudioDurationMs = 0;
     this.assistantAudioPlaybackDurationMs = 0;
+    this.eventCounter = 0;
     this.conversationItems = new Map<string, any>();
-    this.speakerInstance = null;
-    this.audioStream = null;
     this.truncatedAssistantItemIds = new Set<string>();
     this.functionCalls = new Map<string, any>();
+    this.audioDone = false;
 
-    const url = `wss://api.openai.com/v1/realtime?model=${this.MODEL_NAME}`;
-    this.ws = new WebSocket(url, {
-      headers: {
-        Authorization: `Bearer ${this.OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
+    // オーディオ関連の初期化
+    this.micInstance = null;
+    this.speakerInstance = null;
+    this.audioStream = null;
+    this.audioStop = false;
+
+    // WebSocketの初期化
+    this.url = `wss://api.openai.com/v1/realtime?model=${this.MODEL_NAME}`;
+    this.wsHeaders = {
+      Authorization: `Bearer ${this.OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1",
+    };
+
+    this.ws = new WebSocket(this.url, {
+      headers: this.wsHeaders,
     });
 
     this.ws.on("open", async () => {
-      console.log("サーバーに接続しました。");
+      console.log("Connected to the server.");
       await this.setupSession();
       this.startMicrophone();
     });
@@ -73,20 +96,17 @@ class RealtimeChat {
     });
   }
 
-  // イベントIDを生成
   private generateEventId(): string {
     return `event_${this.eventCounter++}`;
   }
 
-  // 初期設定を取得（プレースホルダー）
   private async getInitialSettings() {
-    // TODO: 必要に応じて外部APIから設定を取得する処理を実装
+    // 外部APIから設定を取得する処理を実装する場合はここに記述
     return {
       instructions: "あなたは親切なアシスタントです。",
     };
   }
 
-  // サーバーとのセッションをセットアップ
   private async setupSession() {
     const settings = await this.getInitialSettings();
 
@@ -126,7 +146,6 @@ class RealtimeChat {
     this.ws.send(JSON.stringify(event));
   }
 
-  // マイクからの音声キャプチャを開始
   private startMicrophone() {
     this.micInstance = mic({
       rate: "24000",
@@ -154,7 +173,6 @@ class RealtimeChat {
     this.micInstance.start();
   }
 
-  // 不活性タイマーをリセット
   private resetInactivityTimer() {
     if (this.inactivityTimer) {
       clearTimeout(this.inactivityTimer);
@@ -162,7 +180,6 @@ class RealtimeChat {
     }
   }
 
-  // 不活性タイマーを開始
   private startInactivityTimer() {
     if (
       this.isPlayingAudio ||
@@ -171,125 +188,62 @@ class RealtimeChat {
     ) {
       return;
     }
-
     this.resetInactivityTimer();
-
     this.inactivityTimer = setTimeout(() => {
-      console.log("5秒間発話がなかったため、セッションを終了します。");
-      this.ws.close();
-      process.exit(0);
+      this.handleInactivityTimeout();
     }, 5000);
   }
 
-  // サーバーからのイベントを処理
+  private handleInactivityTimeout() {
+    console.log("5秒間発話がなかったため、セッションを終了します。");
+    this.ws.close();
+    process.exit(0);
+  }
+
   private handleEvent(event: any) {
-    switch (event.type) {
-      case "session.created":
-        console.log("セッションが作成されました。");
-        break;
+    const handlers: { [key: string]: Function } = {
+      "session.created": this.handleSessionCreated.bind(this),
+      "conversation.item.created":
+        this.handleConversationItemCreated.bind(this),
+      "conversation.item.input_audio_transcription.completed":
+        this.handleInputAudioTranscriptionCompleted.bind(this),
+      "response.created": this.handleResponseCreated.bind(this),
+      "response.done": this.handleResponseDone.bind(this),
+      "response.content_part.added":
+        this.handleResponseContentPartAdded.bind(this),
+      "response.text.delta": this.handleResponseTextDelta.bind(this),
+      "response.text.done": this.handleResponseTextDone.bind(this),
+      "response.audio_transcript.delta":
+        this.handleResponseAudioTranscriptDelta.bind(this),
+      "response.audio_transcript.done":
+        this.handleResponseAudioTranscriptDone.bind(this),
+      "response.audio.delta": this.handleResponseAudioDelta.bind(this),
+      "response.audio.done": this.handleResponseAudioDone.bind(this),
+      "input_audio_buffer.speech_started":
+        this.handleInputAudioBufferSpeechStarted.bind(this),
+      "input_audio_buffer.speech_stopped":
+        this.handleInputAudioBufferSpeechStopped.bind(this),
+      "conversation.item.truncated":
+        this.handleConversationItemTruncated.bind(this),
+      "response.function_call_arguments.delta":
+        this.handleResponseFunctionCallArgumentsDelta.bind(this),
+      "response.function_call_arguments.done":
+        this.handleResponseFunctionCallArgumentsDone.bind(this),
+      error: this.handleError.bind(this),
+    };
 
-      case "conversation.item.created":
-        this.handleConversationItemCreated(event);
-        break;
-
-      case "conversation.item.input_audio_transcription.completed":
-        this.handleInputAudioTranscriptionCompleted(event);
-        break;
-
-      case "response.created":
-        this.isAssistantResponding = true;
-        this.resetInactivityTimer();
-        break;
-
-      case "response.done":
-        this.isAssistantResponding = false;
-        this.startInactivityTimer();
-        break;
-
-      case "response.content_part.added":
-        this.handleResponseContentPartAdded(event);
-        break;
-
-      case "response.text.delta":
-        this.handleResponseTextDelta(event);
-        break;
-
-      case "response.text.done":
-        this.handleResponseTextDone(event);
-        break;
-
-      case "response.audio_transcript.delta":
-        this.handleResponseAudioTranscriptDelta(event);
-        break;
-
-      case "response.audio_transcript.done":
-        this.handleResponseAudioTranscriptDone(event);
-        break;
-
-      case "response.audio.delta":
-        this.handleAudioDelta(event);
-        break;
-
-      case "response.audio.done":
-        this.handleAudioDone(event);
-        break;
-
-      case "input_audio_buffer.speech_started":
-        console.log("ユーザーの発話が検出されました。");
-        this.isUserSpeaking = true;
-        if (this.isPlayingAudio && this.lastAssistantItemId !== null) {
-          this.stopAudioPlayback();
-        }
-        this.resetInactivityTimer();
-        break;
-
-      case "input_audio_buffer.speech_stopped":
-        console.log("ユーザーの発話が終了しました。");
-        this.isUserSpeaking = false;
-        this.startInactivityTimer();
-        break;
-
-      case "conversation.item.truncated":
-        this.truncatedAssistantItemIds.add(event.item_id);
-        break;
-
-      case "response.function_call_arguments.delta":
-        this.handleFunctionCallArgumentsDelta(event);
-        break;
-
-      case "response.function_call_arguments.done":
-        this.handleFunctionCallArgumentsDone(event);
-        break;
-
-      case "error":
-        console.error("エラーが発生しました:", event.error);
-        break;
-
-      default:
-        // その他のイベントを処理
-        break;
+    const handler = handlers[event.type];
+    if (handler) {
+      handler(event);
+    } else {
+      // 未処理のイベント
     }
   }
 
-  // コンテンツからテキストを抽出
-  private extractContent(contentArray: any[]): string {
-    if (!Array.isArray(contentArray)) return "[No content]";
-    let contentText = "";
-    for (const contentPart of contentArray) {
-      if (contentPart.type === "text" && contentPart.text) {
-        contentText += contentPart.text;
-      } else if (contentPart.type === "input_audio" && contentPart.transcript) {
-        contentText += contentPart.transcript;
-      } else if (contentPart.type === "input_text" && contentPart.text) {
-        contentText += contentPart.text;
-      } else if (contentPart.type === "audio" && contentPart.transcript) {
-        contentText += contentPart.transcript;
-      }
-    }
-    return contentText || "[No content]";
+  private handleSessionCreated(event: any) {
+    console.log("セッションが作成されました。");
   }
 
-  // 会話アイテムが作成されたときの処理
   private handleConversationItemCreated(event: any) {
     const item = event.item;
     this.conversationItems.set(item.id, item);
@@ -298,46 +252,40 @@ class RealtimeChat {
       this.handleFunctionCall(item);
     } else if (item.role === "assistant") {
       this.resetInactivityTimer();
-
       this.lastAssistantItemId = item.id;
       this.assistantAudioContentIndex = 0;
-
       this.assistantAudioDurationMs = 0;
       this.assistantAudioPlaybackDurationMs = 0;
-
       this.truncatedAssistantItemIds.clear();
-
       this.conversationHistory.push({
         role: item.role,
         content: "",
-        itemId: item.id,
+        item_id: item.id,
       });
     } else if (item.role === "user") {
       this.resetInactivityTimer();
     }
   }
 
-  // 関数呼び出しの処理
   private handleFunctionCall(item: any) {
     const functionName = item.name;
     const callId = item.call_id;
 
     this.functionCalls.set(callId, {
-      itemId: item.id,
-      functionName: functionName,
+      item_id: item.id,
+      function_name: functionName,
       arguments: "",
     });
 
     this.conversationHistory.push({
       role: "assistant",
       type: "function_call",
-      functionName: functionName,
+      function_name: functionName,
       content: "",
-      itemId: item.id,
+      item_id: item.id,
     });
   }
 
-  // ユーザー音声の転写が完了したときの処理
   private handleInputAudioTranscriptionCompleted(event: any) {
     const itemId = event.item_id;
     const transcript = event.transcript;
@@ -345,12 +293,12 @@ class RealtimeChat {
 
     if (item) {
       const contentIndex = event.content_index;
-      if (item.content && item.content[contentIndex]) {
+      if (item.content && item.content.length > contentIndex) {
         item.content[contentIndex].transcript = transcript;
       }
       const content = this.extractContent(item.content);
       const index = this.conversationHistory.findIndex(
-        (msg) => msg.itemId === itemId
+        (msg) => msg.item_id === itemId
       );
       if (index !== -1) {
         this.conversationHistory[index].content = content;
@@ -358,14 +306,24 @@ class RealtimeChat {
         this.conversationHistory.push({
           role: item.role,
           content: content,
-          itemId: itemId,
+          item_id: itemId,
         });
       }
       this.outputConversationLog();
     }
   }
 
-  // レスポンスのコンテンツパートが追加されたときの処理
+  private handleResponseCreated(event: any) {
+    this.isAssistantResponding = true;
+    this.resetInactivityTimer();
+    this.audioDone = false; // 音声データの受信開始
+  }
+
+  private handleResponseDone(event: any) {
+    this.isAssistantResponding = false;
+    // this.startInactivityTimer() は audioStream の end イベントで行う
+  }
+
   private handleResponseContentPartAdded(event: any) {
     const itemId = event.item_id;
     const contentIndex = event.content_index;
@@ -373,34 +331,35 @@ class RealtimeChat {
     const item = this.conversationItems.get(itemId);
     if (item) {
       item.content = item.content || [];
+      while (item.content.length <= contentIndex) {
+        item.content.push({});
+      }
       item.content[contentIndex] = part;
     }
   }
 
-  // レスポンスのテキストデルタを処理
   private handleResponseTextDelta(event: any) {
     const itemId = event.item_id;
     const contentIndex = event.content_index;
     const delta = event.delta;
     const item = this.conversationItems.get(itemId);
-    if (item && item.content && item.content[contentIndex]) {
+    if (item && item.content && item.content.length > contentIndex) {
       item.content[contentIndex].text =
         (item.content[contentIndex].text || "") + delta;
     }
   }
 
-  // レスポンスのテキストが完了したときの処理
   private handleResponseTextDone(event: any) {
     const itemId = event.item_id;
     const contentIndex = event.content_index;
     const text = event.text;
     const item = this.conversationItems.get(itemId);
 
-    if (item && item.content && item.content[contentIndex]) {
+    if (item && item.content && item.content.length > contentIndex) {
       item.content[contentIndex].text = text;
       const content = this.extractContent(item.content);
       const index = this.conversationHistory.findIndex(
-        (msg) => msg.itemId === itemId
+        (msg) => msg.item_id === itemId
       );
       if (index !== -1) {
         this.conversationHistory[index].content = content;
@@ -408,37 +367,35 @@ class RealtimeChat {
         this.conversationHistory.push({
           role: item.role,
           content: content,
-          itemId: itemId,
+          item_id: itemId,
         });
       }
       this.outputConversationLog();
     }
   }
 
-  // レスポンスの音声転写デルタを処理
   private handleResponseAudioTranscriptDelta(event: any) {
     const itemId = event.item_id;
     const contentIndex = event.content_index;
     const delta = event.delta;
     const item = this.conversationItems.get(itemId);
-    if (item && item.content && item.content[contentIndex]) {
+    if (item && item.content && item.content.length > contentIndex) {
       item.content[contentIndex].transcript =
         (item.content[contentIndex].transcript || "") + delta;
     }
   }
 
-  // レスポンスの音声転写が完了したときの処理
   private handleResponseAudioTranscriptDone(event: any) {
     const itemId = event.item_id;
     const contentIndex = event.content_index;
     const transcript = event.transcript;
     const item = this.conversationItems.get(itemId);
 
-    if (item && item.content && item.content[contentIndex]) {
+    if (item && item.content && item.content.length > contentIndex) {
       item.content[contentIndex].transcript = transcript;
       const content = this.extractContent(item.content);
       const index = this.conversationHistory.findIndex(
-        (msg) => msg.itemId === itemId
+        (msg) => msg.item_id === itemId
       );
       if (index !== -1) {
         this.conversationHistory[index].content = content;
@@ -446,14 +403,13 @@ class RealtimeChat {
         this.conversationHistory.push({
           role: item.role,
           content: content,
-          itemId: itemId,
+          item_id: itemId,
         });
       }
     }
   }
 
-  // サーバーからのオーディオデルタを処理
-  private handleAudioDelta(event: any) {
+  private handleResponseAudioDelta(event: any) {
     const itemId = event.item_id;
 
     if (this.truncatedAssistantItemIds.has(itemId)) {
@@ -508,90 +464,47 @@ class RealtimeChat {
     this.assistantAudioDurationMs += deltaDurationMs;
   }
 
-  // サーバーからのオーディオ再生が完了したときの処理
-  private async handleAudioDone(event: any) {
+  private handleResponseAudioDone(event: any) {
+    this.audioDone = true; // 音声データの受信完了を設定
     if (this.audioStream) {
       this.audioStream.end();
     }
   }
 
-  // 音声再生を停止
-  private stopAudioPlayback() {
-    this.isPlayingAudio = false;
-
-    if (this.audioStream) {
-      this.audioStream.unpipe();
-      this.audioStream.end();
-      this.audioStream = null;
+  private handleInputAudioBufferSpeechStarted(event: any) {
+    console.log("ユーザーの発話が検出されました。");
+    this.isUserSpeaking = true;
+    if (this.isPlayingAudio && this.lastAssistantItemId) {
+      this.truncateAssistantSpeech(
+        this.lastAssistantItemId,
+        this.assistantAudioContentIndex!
+      );
+      this.stopAudioPlayback();
     }
+    this.resetInactivityTimer();
+  }
 
-    if (this.speakerInstance) {
-      this.speakerInstance.end();
-      this.speakerInstance = null;
-    }
-
+  private handleInputAudioBufferSpeechStopped(event: any) {
+    console.log("ユーザーの発話が終了しました。");
+    this.isUserSpeaking = false;
     this.startInactivityTimer();
   }
 
-  // 会話履歴を出力
-  private outputConversationLog() {
-    console.log("会話履歴:");
-    this.conversationHistory.forEach((item) => {
-      const role = item.role;
-      const content = item.content || "[No content]";
-      if (item.type === "function_call") {
-        console.log(
-          `${role}が関数 ${item.functionName} を呼び出しました。引数: ${content}`
-        );
-      } else if (item.type === "function_call_output") {
-        console.log(`関数 ${item.functionName} の戻り値: ${content}`);
-      } else {
-        console.log(`${role}: ${content}`);
-      }
-    });
-  }
-
-  // Functionsを更新
-  public updateFunctions(functionsList: any[]) {
-    const event = {
-      event_id: this.generateEventId(),
-      type: "session.update",
-      session: {
-        tools: functionsList,
-      },
-    };
-    this.ws.send(JSON.stringify(event));
-  }
-
-  // アシスタントの発話をトランケート
-  public truncateAssistantSpeech(itemId: string, contentIndex: number) {
-    const audioEndMs = Math.round(this.assistantAudioPlaybackDurationMs);
-
-    const event = {
-      event_id: this.generateEventId(),
-      type: "conversation.item.truncate",
-      item_id: itemId,
-      content_index: contentIndex,
-      audio_end_ms: audioEndMs,
-    };
-    this.ws.send(JSON.stringify(event));
-
+  private handleConversationItemTruncated(event: any) {
+    const itemId = event.item_id;
     this.truncatedAssistantItemIds.add(itemId);
   }
 
-  // 関数呼び出しの引数のデルタを処理
-  private handleFunctionCallArgumentsDelta(event: any) {
+  private handleResponseFunctionCallArgumentsDelta(event: any) {
     const callId = event.call_id;
     const delta = event.delta;
     const functionCall = this.functionCalls.get(callId);
-
     if (functionCall) {
       functionCall.arguments += delta;
     }
   }
 
-  // 関数呼び出しの引数が完了したときの処理
-  private handleFunctionCallArgumentsDone(event: any) {
+  private async handleResponseFunctionCallArgumentsDone(event: any) {
     const callId = event.call_id;
     const argumentsStr = event.arguments;
     const functionCall = this.functionCalls.get(callId);
@@ -608,10 +521,10 @@ class RealtimeChat {
 
       let result;
 
-      if (functionCall.functionName === "get_weather") {
+      if (functionCall.function_name === "get_weather") {
         result = this.mockGetWeather(args.location);
       } else {
-        result = { error: "未知の関数: " + functionCall.functionName };
+        result = { error: "未知の関数: " + functionCall.function_name };
       }
 
       // 関数の出力をサーバーに送信
@@ -630,9 +543,9 @@ class RealtimeChat {
       this.conversationHistory.push({
         role: "function",
         type: "function_call_output",
-        functionName: functionCall.functionName,
+        function_name: functionCall.function_name,
         content: JSON.stringify(result),
-        itemId: this.generateEventId(),
+        item_id: this.generateEventId(),
       });
 
       // 会話履歴を出力
@@ -651,7 +564,88 @@ class RealtimeChat {
     }
   }
 
-  // モックの天気取得関数
+  private handleError(event: any) {
+    console.error("エラーが発生しました:", event.error);
+  }
+
+  private extractContent(contentArray: any[]): string {
+    if (!Array.isArray(contentArray)) return "[No content]";
+    let contentText = "";
+    for (const contentPart of contentArray) {
+      if (contentPart.type === "text" && contentPart.text) {
+        contentText += contentPart.text;
+      } else if (contentPart.type === "input_audio" && contentPart.transcript) {
+        contentText += contentPart.transcript;
+      } else if (contentPart.type === "input_text" && contentPart.text) {
+        contentText += contentPart.text;
+      } else if (contentPart.type === "audio" && contentPart.transcript) {
+        contentText += contentPart.transcript;
+      }
+    }
+    return contentText || "[No content]";
+  }
+
+  private stopAudioPlayback() {
+    this.isPlayingAudio = false;
+    this.audioDone = true; // 受信完了を設定
+
+    if (this.audioStream) {
+      this.audioStream.unpipe();
+      this.audioStream.end();
+      this.audioStream = null;
+    }
+
+    if (this.speakerInstance) {
+      this.speakerInstance.end();
+      this.speakerInstance = null;
+    }
+
+    this.startInactivityTimer();
+  }
+
+  private outputConversationLog() {
+    console.log("会話履歴:");
+    this.conversationHistory.forEach((item) => {
+      const role = item.role;
+      const content = item.content || "[No content]";
+      if (item.type === "function_call") {
+        console.log(
+          `${role}が関数 ${item.function_name} を呼び出しました。引数: ${content}`
+        );
+      } else if (item.type === "function_call_output") {
+        console.log(`関数 ${item.function_name} の戻り値: ${content}`);
+      } else {
+        console.log(`${role}: ${content}`);
+      }
+    });
+  }
+
+  public updateFunctions(functionsList: any[]) {
+    const event = {
+      event_id: this.generateEventId(),
+      type: "session.update",
+      session: {
+        tools: functionsList,
+      },
+    };
+    this.ws.send(JSON.stringify(event));
+  }
+
+  public truncateAssistantSpeech(itemId: string, contentIndex: number) {
+    const audioEndMs = Math.round(this.assistantAudioPlaybackDurationMs);
+
+    const event = {
+      event_id: this.generateEventId(),
+      type: "conversation.item.truncate",
+      item_id: itemId,
+      content_index: contentIndex,
+      audio_end_ms: audioEndMs,
+    };
+    this.ws.send(JSON.stringify(event));
+
+    this.truncatedAssistantItemIds.add(itemId);
+  }
+
   private mockGetWeather(location: string) {
     return {
       location: location,
@@ -659,7 +653,27 @@ class RealtimeChat {
       temperature: "25°C",
     };
   }
+
+  public close() {
+    // クリーンアップ
+    this.audioStop = true;
+    if (this.micInstance) {
+      this.micInstance.stop();
+    }
+    if (this.audioStream) {
+      this.audioStream.end();
+    }
+    if (this.speakerInstance) {
+      this.speakerInstance.end();
+    }
+  }
 }
 
-// チャットをインスタンス化して実行
+// 実行部分
 const chat = new RealtimeChat();
+
+process.on("SIGINT", () => {
+  console.log("ユーザーによって中断されました。");
+  chat.close();
+  process.exit(0);
+});
