@@ -6,6 +6,7 @@ import { PassThrough } from "stream";
 import axios from "axios"; // axiosをインポート
 import { FunctionDef, ToolSearchApiResponse, BaseTool } from "tool"; // 型定義をインポート
 import { updateToolListFunction } from "./tools";
+import { Thread } from "thread";
 
 // Node.jsの組み込みfetchを使用するためにNode.js v18以上が必要です
 dotenv.config();
@@ -13,6 +14,7 @@ dotenv.config();
 class RealtimeChat {
   private OPENAI_API_KEY: string;
   private MODEL_NAME: string;
+  private threadId: string;
 
   // 状態変数
   private conversationHistory: any[];
@@ -47,10 +49,11 @@ class RealtimeChat {
   private dynamicTools: Map<string, ToolSearchApiResponse>;
   private pendingFunctionCalls: Map<string, Function>;
 
-  constructor() {
+  constructor(options?: { threadId?: string }) {
     // 設定
     this.OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
     this.MODEL_NAME = "gpt-4o-realtime-preview-2024-10-01";
+    this.threadId = options?.threadId || process.env.ASSISTANT_HUB_THREAD_ID!;
 
     // 状態変数の初期化
     this.conversationHistory = [];
@@ -119,14 +122,34 @@ class RealtimeChat {
 
   // 初期設定を取得（外部APIから取得する場合はここで実装）
   private async getInitialSettings() {
-    return {
-      instructions: "あなたは親切なアシスタントです。",
-    };
+    // ツール検索APIを呼び出す
+    const apiUrl =
+      process.env.ASSISTANT_HUB_BASE_URL ||
+      "https://assistant-hub-zeta.vercel.app";
+    const endpoint = `${apiUrl}/api/threads/${this.threadId}`;
+
+    const apiKey = process.env.ASSISTANT_HUB_API_KEY;
+
+    try {
+      // axiosを使用してAPIを呼び出す
+      const response = await axios.get(endpoint, {
+        headers: {
+          "X-Service-API-Key": apiKey,
+          "Content-Type": "application/json",
+        },
+      });
+
+      return response.data as Thread;
+    } catch (e) {
+      console.error(e);
+      process.exit(0);
+    }
   }
 
   // セッションの設定を送信
   private async setupSession() {
     const settings = await this.getInitialSettings();
+    const instructions = `${settings.system_prompt}\n\n${settings.memory}`;
 
     const functionsList: FunctionDef[] = [updateToolListFunction];
 
@@ -134,7 +157,7 @@ class RealtimeChat {
       event_id: this.generateEventId(),
       type: "session.update",
       session: {
-        instructions: settings.instructions,
+        instructions,
         modalities: ["audio", "text"],
         input_audio_transcription: {
           model: "whisper-1",
@@ -353,7 +376,6 @@ class RealtimeChat {
       process.env.ASSISTANT_HUB_BASE_URL ||
       "https://assistant-hub-zeta.vercel.app";
     const searchEndpoint = `${apiUrl}/api/tools/search`;
-    console.log(`ツール検索エンドポイント: ${searchEndpoint}`);
 
     const apiKey = process.env.ASSISTANT_HUB_API_KEY;
 
@@ -523,9 +545,7 @@ class RealtimeChat {
     const toolId = toolInfo.baseTool.id;
 
     // ログに動的ツールの呼び出しを表示
-    console.log(
-      `動的ツールが呼び出されました: ${functionName} - ${toolInfo.baseTool.description}`
-    );
+    console.log(`動的ツールが呼び出されました: ${toolInfo.baseTool.name}`);
 
     // ツール実行APIを呼び出す
     const apiUrl =
