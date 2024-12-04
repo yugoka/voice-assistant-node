@@ -3,8 +3,11 @@ import dotenv from "dotenv";
 import mic from "mic";
 import Speaker from "speaker";
 import { PassThrough } from "stream";
-import { Readable } from "stream";
+import axios from "axios"; // axiosをインポート
+import { FunctionDef, ToolSearchApiResponse, BaseTool } from "tool"; // 型定義をインポート
+import { updateToolListFunction } from "./tools";
 
+// Node.jsの組み込みfetchを使用するためにNode.js v18以上が必要です
 dotenv.config();
 
 class RealtimeChat {
@@ -26,6 +29,8 @@ class RealtimeChat {
   private truncatedAssistantItemIds: Set<string>;
   private functionCalls: Map<string, any>;
   private audioDone: boolean;
+  private responseInProgress: boolean;
+  private responseQueue: any[];
 
   // オーディオ関連
   private micInstance: any;
@@ -37,6 +42,10 @@ class RealtimeChat {
   private ws: WebSocket;
   private url: string;
   private wsHeaders: any;
+
+  // 新しく追加した変数
+  private dynamicTools: Map<string, ToolSearchApiResponse>;
+  private pendingFunctionCalls: Map<string, Function>;
 
   constructor() {
     // 設定
@@ -58,6 +67,8 @@ class RealtimeChat {
     this.truncatedAssistantItemIds = new Set<string>();
     this.functionCalls = new Map<string, any>();
     this.audioDone = false;
+    this.responseInProgress = false;
+    this.responseQueue = [];
 
     // オーディオ関連の初期化
     this.micInstance = null;
@@ -77,7 +88,7 @@ class RealtimeChat {
     });
 
     this.ws.on("open", async () => {
-      console.log("Connected to the server.");
+      console.log("サーバーに接続しました。");
       await this.setupSession();
       this.startMicrophone();
     });
@@ -94,36 +105,30 @@ class RealtimeChat {
     this.ws.on("error", (err: Error) => {
       console.error("WebSocketエラー:", err);
     });
+
+    // 動的ツールの初期化
+    this.dynamicTools = new Map<string, ToolSearchApiResponse>();
+    // ペンディング中の関数呼び出しを管理するマップ
+    this.pendingFunctionCalls = new Map<string, Function>();
   }
 
+  // イベントIDを生成
   private generateEventId(): string {
     return `event_${this.eventCounter++}`;
   }
 
+  // 初期設定を取得（外部APIから取得する場合はここで実装）
   private async getInitialSettings() {
-    // 外部APIから設定を取得する処理を実装する場合はここに記述
     return {
       instructions: "あなたは親切なアシスタントです。",
     };
   }
 
+  // セッションの設定を送信
   private async setupSession() {
     const settings = await this.getInitialSettings();
 
-    const functionsList = [
-      {
-        type: "function",
-        name: "get_weather",
-        description: "現在の天気を取得します。",
-        parameters: {
-          type: "object",
-          properties: {
-            location: { type: "string" },
-          },
-          required: ["location"],
-        },
-      },
-    ];
+    const functionsList: FunctionDef[] = [updateToolListFunction];
 
     const event = {
       event_id: this.generateEventId(),
@@ -146,6 +151,7 @@ class RealtimeChat {
     this.ws.send(JSON.stringify(event));
   }
 
+  // マイクを開始
   private startMicrophone() {
     this.micInstance = mic({
       rate: "24000",
@@ -173,6 +179,7 @@ class RealtimeChat {
     this.micInstance.start();
   }
 
+  // 非アクティブタイマーをリセット
   private resetInactivityTimer() {
     if (this.inactivityTimer) {
       clearTimeout(this.inactivityTimer);
@@ -180,6 +187,7 @@ class RealtimeChat {
     }
   }
 
+  // 非アクティブタイマーを開始
   private startInactivityTimer() {
     if (
       this.isPlayingAudio ||
@@ -194,13 +202,15 @@ class RealtimeChat {
     }, 5000);
   }
 
+  // 非アクティブタイマーのタイムアウト処理
   private handleInactivityTimeout() {
     console.log("5秒間発話がなかったため、セッションを終了します。");
     this.ws.close();
     process.exit(0);
   }
 
-  private handleEvent(event: any) {
+  // イベントを処理
+  private async handleEvent(event: any) {
     const handlers: { [key: string]: Function } = {
       "session.created": this.handleSessionCreated.bind(this),
       "conversation.item.created":
@@ -234,22 +244,24 @@ class RealtimeChat {
 
     const handler = handlers[event.type];
     if (handler) {
-      handler(event);
+      await handler(event);
     } else {
       // 未処理のイベント
     }
   }
 
+  // セッションが作成されたときの処理
   private handleSessionCreated(event: any) {
     console.log("セッションが作成されました。");
   }
 
-  private handleConversationItemCreated(event: any) {
+  // 会話アイテムが作成されたときの処理
+  private async handleConversationItemCreated(event: any) {
     const item = event.item;
     this.conversationItems.set(item.id, item);
 
     if (item.type === "function_call") {
-      this.handleFunctionCall(item);
+      await this.handleFunctionCall(item);
     } else if (item.role === "assistant") {
       this.resetInactivityTimer();
       this.lastAssistantItemId = item.id;
@@ -264,10 +276,17 @@ class RealtimeChat {
       });
     } else if (item.role === "user") {
       this.resetInactivityTimer();
+      // ユーザーメッセージを会話履歴に追加（内容はまだ空）
+      this.conversationHistory.push({
+        role: item.role,
+        content: "",
+        item_id: item.id,
+      });
     }
   }
 
-  private handleFunctionCall(item: any) {
+  // 関数呼び出しの処理
+  private async handleFunctionCall(item: any) {
     const functionName = item.name;
     const callId = item.call_id;
 
@@ -284,8 +303,301 @@ class RealtimeChat {
       content: "",
       item_id: item.id,
     });
+
+    if (functionName === "update_tools_list") {
+      // ユーザーの最新の入力が利用可能か確認
+      const lastUserMessage = this.getLastUserMessage();
+      if (lastUserMessage && lastUserMessage.content) {
+        // ユーザー入力がすでに利用可能
+        await this.handleUpdateToolsList(callId);
+      } else {
+        // ユーザー入力がまだ利用できないので、ペンディングに追加
+        this.pendingFunctionCalls.set(callId, async () => {
+          await this.handleUpdateToolsList(callId);
+        });
+      }
+    } else {
+      // 他の動的に取得した関数が呼び出された場合
+      // 引数がまだ収集されていないため、ペンディングに追加
+      this.pendingFunctionCalls.set(callId, async () => {
+        await this.handleDynamicFunctionCall(functionName, callId);
+      });
+    }
   }
 
+  // 最新のユーザーメッセージを取得
+  private getLastUserMessage() {
+    return this.conversationHistory
+      .slice()
+      .reverse()
+      .find((msg) => msg.role === "user");
+  }
+
+  // update_tools_listを処理（axiosを使用）
+  private async handleUpdateToolsList(callId: string) {
+    // 最後のユーザーメッセージを取得
+    const lastUserMessage = this.getLastUserMessage();
+
+    if (!lastUserMessage || !lastUserMessage.content) {
+      console.error(
+        "ツール検索クエリのためのユーザーメッセージが見つかりません。"
+      );
+      return;
+    }
+
+    const query = lastUserMessage.content;
+    console.log(query);
+
+    // ツール検索APIを呼び出す
+    const apiUrl =
+      process.env.ASSISTANT_HUB_BASE_URL ||
+      "https://assistant-hub-zeta.vercel.app";
+    const searchEndpoint = `${apiUrl}/api/tools/search`;
+    console.log(searchEndpoint);
+
+    const apiKey = process.env.ASSISTANT_HUB_API_KEY;
+
+    try {
+      // axiosを使用してAPIを呼び出す
+      const response = await axios.post(
+        searchEndpoint,
+        {
+          query: query,
+          openai_tools_mode: true,
+        },
+        {
+          headers: {
+            "X-Service-API-Key": apiKey,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      const results = response.data as ToolSearchApiResponse[];
+
+      // 動的ツールのマップを初期化
+      this.dynamicTools = new Map<string, ToolSearchApiResponse>();
+
+      const functionsList: FunctionDef[] = [];
+
+      for (const result of results) {
+        const functionDef = result.function;
+        const toolId = result.baseTool.id;
+
+        if (!toolId) {
+          console.error(
+            `関数${functionDef.name}のツールIDが見つかりませんでした。`
+          );
+          continue;
+        }
+
+        functionsList.push({
+          ...functionDef,
+          type: "function",
+          baseTool: undefined,
+        });
+
+        // 関数名からツールIDへのマッピングを保存
+        this.dynamicTools.set(functionDef.name, result);
+      }
+
+      // 'update_tools_list'を追加
+      functionsList.push(updateToolListFunction);
+
+      // セッションのツールを更新
+      this.updateFunctions(functionsList);
+
+      // 関数の出力をアシスタントに送信
+      const resultMessage = { message: "ツールリストが更新されました。" };
+
+      const event = {
+        event_id: this.generateEventId(),
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: callId,
+          output: JSON.stringify(resultMessage),
+        },
+      };
+      this.ws.send(JSON.stringify(event));
+
+      // 会話履歴を更新
+      this.conversationHistory.push({
+        role: "function",
+        type: "function_call_output",
+        function_name: "update_tools_list",
+        content: JSON.stringify(resultMessage),
+        item_id: this.generateEventId(),
+      });
+
+      // 関数呼び出しをペンディングリストから削除
+      this.pendingFunctionCalls.delete(callId);
+
+      // アシスタントの応答をトリガー
+      this.sendResponseCreateEvent({
+        event_id: this.generateEventId(),
+        type: "response.create",
+        response: {},
+      });
+    } catch (error: any) {
+      if (error.response) {
+        console.error(
+          `ツール検索APIリクエストがステータス${error.response.status}で失敗しました`
+        );
+        console.error("レスポンスデータ:", error.response.data);
+      } else {
+        console.error(
+          "ツール検索APIの呼び出し中にエラーが発生しました:",
+          error.message
+        );
+      }
+    }
+  }
+
+  // 動的に取得した関数呼び出しを処理（axiosを使用）
+  private async handleDynamicFunctionCall(
+    functionName: string,
+    callId: string
+  ) {
+    const functionCall = this.functionCalls.get(callId);
+    if (!functionCall) {
+      console.error(`callId ${callId}に対応する関数呼び出しが見つかりません。`);
+      return;
+    }
+
+    // 関数の引数が収集されるのを待つ
+    // functionCall.argumentsはhandleResponseFunctionCallArgumentsDeltaとhandleResponseFunctionCallArgumentsDoneで更新されます
+
+    let args;
+    try {
+      args = JSON.parse(functionCall.arguments);
+    } catch (err) {
+      console.error("関数引数の解析に失敗しました:", err);
+      args = {};
+    }
+
+    // dynamicToolsからツール情報を取得
+    const toolInfo = this.dynamicTools.get(functionName);
+
+    if (!toolInfo) {
+      console.error(`関数${functionName}が動的ツールに見つかりませんでした。`);
+
+      // エラーメッセージをアシスタントに返す
+      const errorMessage = {
+        error: `関数${functionName}が見つかりませんでした。`,
+      };
+
+      const event = {
+        event_id: this.generateEventId(),
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: callId,
+          output: JSON.stringify(errorMessage),
+        },
+      };
+      this.ws.send(JSON.stringify(event));
+
+      // 会話履歴を更新
+      this.conversationHistory.push({
+        role: "function",
+        type: "function_call_output",
+        function_name: functionName,
+        content: JSON.stringify(errorMessage),
+        item_id: this.generateEventId(),
+      });
+
+      // 関数呼び出しをペンディングリストから削除
+      this.pendingFunctionCalls.delete(callId);
+
+      // アシスタントの応答をトリガー
+      this.sendResponseCreateEvent({
+        event_id: this.generateEventId(),
+        type: "response.create",
+        response: {},
+      });
+
+      return;
+    }
+
+    const toolId = toolInfo.baseTool.id;
+
+    // ツール実行APIを呼び出す
+    const apiUrl =
+      process.env.ASSISTANT_HUB_BASE_URL ||
+      "https://assistant-hub-zeta.vercel.app";
+    const executeEndpoint = `${apiUrl}/api/tools/${toolId}/execute`;
+
+    const apiKey = process.env.ASSISTANT_HUB_API_KEY;
+
+    const path = toolInfo.path;
+    const method = toolInfo.method;
+
+    try {
+      // axiosを使用してAPIを呼び出す
+      const response = await axios.post(
+        executeEndpoint,
+        {
+          arguments: JSON.stringify(args),
+          path: path,
+          method: method,
+        },
+        {
+          headers: {
+            "X-Service-API-Key": apiKey,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      const result = response.data;
+
+      // 関数の出力をアシスタントに送信
+      const event = {
+        event_id: this.generateEventId(),
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: callId,
+          output: JSON.stringify(result),
+        },
+      };
+      this.ws.send(JSON.stringify(event));
+
+      // 会話履歴を更新
+      this.conversationHistory.push({
+        role: "function",
+        type: "function_call_output",
+        function_name: functionName,
+        content: JSON.stringify(result),
+        item_id: this.generateEventId(),
+      });
+
+      // 関数呼び出しをペンディングリストから削除
+      this.pendingFunctionCalls.delete(callId);
+
+      // アシスタントの応答をトリガー
+      this.sendResponseCreateEvent({
+        event_id: this.generateEventId(),
+        type: "response.create",
+        response: {},
+      });
+    } catch (error: any) {
+      if (error.response) {
+        console.error(
+          `ツール実行APIリクエストがステータス${error.response.status}で失敗しました`
+        );
+        console.error("レスポンスデータ:", error.response.data);
+      } else {
+        console.error(
+          "ツール実行APIの呼び出し中にエラーが発生しました:",
+          error.message
+        );
+      }
+    }
+  }
+
+  // ユーザーの音声入力がトランスクリプトされたときの処理
   private handleInputAudioTranscriptionCompleted(event: any) {
     const itemId = event.item_id;
     const transcript = event.transcript;
@@ -310,20 +622,38 @@ class RealtimeChat {
         });
       }
       this.outputConversationLog();
+
+      // ペンディング中の関数呼び出しがあれば処理
+      this.pendingFunctionCalls.forEach(async (func, pendingCallId) => {
+        await func();
+        this.pendingFunctionCalls.delete(pendingCallId);
+      });
     }
   }
 
+  // レスポンスが作成されたときの処理
   private handleResponseCreated(event: any) {
     this.isAssistantResponding = true;
     this.resetInactivityTimer();
     this.audioDone = false; // 音声データの受信開始
+    this.responseInProgress = true; // レスポンスが進行中であることを設定
   }
 
+  // レスポンスが完了したときの処理
   private handleResponseDone(event: any) {
     this.isAssistantResponding = false;
+    this.responseInProgress = false; // レスポンスが完了したのでフラグをリセット
+
+    // キューに保留中のレスポンスがあれば送信
+    if (this.responseQueue.length > 0) {
+      const nextResponseEvent = this.responseQueue.shift();
+      this.sendResponseCreateEvent(nextResponseEvent);
+    }
+
     // this.startInactivityTimer() は audioStream の end イベントで行う
   }
 
+  // レスポンスのコンテンツパートが追加されたときの処理
   private handleResponseContentPartAdded(event: any) {
     const itemId = event.item_id;
     const contentIndex = event.content_index;
@@ -338,6 +668,7 @@ class RealtimeChat {
     }
   }
 
+  // レスポンスのテキストが更新されたときの処理
   private handleResponseTextDelta(event: any) {
     const itemId = event.item_id;
     const contentIndex = event.content_index;
@@ -349,6 +680,7 @@ class RealtimeChat {
     }
   }
 
+  // レスポンスのテキストが完了したときの処理
   private handleResponseTextDone(event: any) {
     const itemId = event.item_id;
     const contentIndex = event.content_index;
@@ -374,6 +706,7 @@ class RealtimeChat {
     }
   }
 
+  // レスポンスの音声トランスクリプトが更新されたときの処理
   private handleResponseAudioTranscriptDelta(event: any) {
     const itemId = event.item_id;
     const contentIndex = event.content_index;
@@ -385,6 +718,7 @@ class RealtimeChat {
     }
   }
 
+  // レスポンスの音声トランスクリプトが完了したときの処理
   private handleResponseAudioTranscriptDone(event: any) {
     const itemId = event.item_id;
     const contentIndex = event.content_index;
@@ -409,6 +743,7 @@ class RealtimeChat {
     }
   }
 
+  // レスポンスの音声データが更新されたときの処理
   private handleResponseAudioDelta(event: any) {
     const itemId = event.item_id;
 
@@ -464,6 +799,7 @@ class RealtimeChat {
     this.assistantAudioDurationMs += deltaDurationMs;
   }
 
+  // レスポンスの音声データが完了したときの処理
   private handleResponseAudioDone(event: any) {
     this.audioDone = true; // 音声データの受信完了を設定
     if (this.audioStream) {
@@ -471,6 +807,7 @@ class RealtimeChat {
     }
   }
 
+  // ユーザーの発話が開始されたときの処理
   private handleInputAudioBufferSpeechStarted(event: any) {
     console.log("ユーザーの発話が検出されました。");
     this.isUserSpeaking = true;
@@ -484,17 +821,20 @@ class RealtimeChat {
     this.resetInactivityTimer();
   }
 
+  // ユーザーの発話が終了したときの処理
   private handleInputAudioBufferSpeechStopped(event: any) {
     console.log("ユーザーの発話が終了しました。");
     this.isUserSpeaking = false;
     this.startInactivityTimer();
   }
 
+  // 会話アイテムがトランケートされたときの処理
   private handleConversationItemTruncated(event: any) {
     const itemId = event.item_id;
     this.truncatedAssistantItemIds.add(itemId);
   }
 
+  // 関数呼び出しの引数が更新されたときの処理
   private handleResponseFunctionCallArgumentsDelta(event: any) {
     const callId = event.call_id;
     const delta = event.delta;
@@ -504,6 +844,7 @@ class RealtimeChat {
     }
   }
 
+  // 関数呼び出しの引数が完了したときの処理
   private async handleResponseFunctionCallArgumentsDone(event: any) {
     const callId = event.call_id;
     const argumentsStr = event.arguments;
@@ -511,63 +852,24 @@ class RealtimeChat {
 
     if (functionCall) {
       functionCall.arguments = argumentsStr;
-      let args;
-      try {
-        args = JSON.parse(argumentsStr);
-      } catch (err) {
-        console.error("関数引数の解析に失敗しました:", err);
-        args = {};
+
+      if (functionCall.function_name !== "update_tools_list") {
+        await this.handleDynamicFunctionCall(
+          functionCall.function_name,
+          callId
+        );
+        // 関数呼び出しをクリーンアップ
+        this.functionCalls.delete(callId);
       }
-
-      let result;
-
-      if (functionCall.function_name === "get_weather") {
-        result = this.mockGetWeather(args.location);
-      } else {
-        result = { error: "未知の関数: " + functionCall.function_name };
-      }
-
-      // 関数の出力をサーバーに送信
-      const event = {
-        event_id: this.generateEventId(),
-        type: "conversation.item.create",
-        item: {
-          type: "function_call_output",
-          call_id: callId,
-          output: JSON.stringify(result),
-        },
-      };
-      this.ws.send(JSON.stringify(event));
-
-      // 会話履歴に関数の出力を追加
-      this.conversationHistory.push({
-        role: "function",
-        type: "function_call_output",
-        function_name: functionCall.function_name,
-        content: JSON.stringify(result),
-        item_id: this.generateEventId(),
-      });
-
-      // 会話履歴を出力
-      this.outputConversationLog();
-
-      // アシスタントの応答をトリガー
-      const responseEvent = {
-        event_id: this.generateEventId(),
-        type: "response.create",
-        response: {},
-      };
-      this.ws.send(JSON.stringify(responseEvent));
-
-      // クリーンアップ
-      this.functionCalls.delete(callId);
     }
   }
 
+  // エラーが発生したときの処理
   private handleError(event: any) {
     console.error("エラーが発生しました:", event.error);
   }
 
+  // コンテンツを抽出
   private extractContent(contentArray: any[]): string {
     if (!Array.isArray(contentArray)) return "[No content]";
     let contentText = "";
@@ -585,6 +887,7 @@ class RealtimeChat {
     return contentText || "[No content]";
   }
 
+  // オーディオ再生を停止
   private stopAudioPlayback() {
     this.isPlayingAudio = false;
     this.audioDone = true; // 受信完了を設定
@@ -603,6 +906,7 @@ class RealtimeChat {
     this.startInactivityTimer();
   }
 
+  // 会話履歴を出力
   private outputConversationLog() {
     console.log("会話履歴:");
     this.conversationHistory.forEach((item) => {
@@ -620,7 +924,8 @@ class RealtimeChat {
     });
   }
 
-  public updateFunctions(functionsList: any[]) {
+  // セッションのツールリストを更新
+  public updateFunctions(functionsList: FunctionDef[]) {
     const event = {
       event_id: this.generateEventId(),
       type: "session.update",
@@ -631,6 +936,7 @@ class RealtimeChat {
     this.ws.send(JSON.stringify(event));
   }
 
+  // アシスタントの発話をトランケート
   public truncateAssistantSpeech(itemId: string, contentIndex: number) {
     const audioEndMs = Math.round(this.assistantAudioPlaybackDurationMs);
 
@@ -646,16 +952,18 @@ class RealtimeChat {
     this.truncatedAssistantItemIds.add(itemId);
   }
 
-  private mockGetWeather(location: string) {
-    return {
-      location: location,
-      forecast: "晴れ時々曇り",
-      temperature: "25°C",
-    };
+  // レスポンスを送信するヘルパーメソッド
+  private sendResponseCreateEvent(event: any) {
+    if (!this.responseInProgress) {
+      this.ws.send(JSON.stringify(event));
+      this.responseInProgress = true;
+    } else {
+      this.responseQueue.push(event);
+    }
   }
 
+  // クリーンアップ処理
   public close() {
-    // クリーンアップ
     this.audioStop = true;
     if (this.micInstance) {
       this.micInstance.stop();
