@@ -155,7 +155,21 @@ class RealtimeChat {
   // セッションの設定を送信
   private async setupSession() {
     const settings = await this.getInitialSettings();
-    const instructions = `${settings.system_prompt}\n\n${settings.memory}`;
+    const instructions =
+      `${settings.system_prompt}\n\n${settings.memory}`.replace(
+        "<japanese_time>",
+        new Date().toLocaleString("ja-JP", {
+          timeZone: "Asia/Tokyo",
+          timeZoneName: "short", // JST と表示
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: false,
+        })
+      );
     console.log(instructions);
 
     const functionsList: FunctionDef[] = [updateToolListFunction];
@@ -945,7 +959,7 @@ class RealtimeChat {
 
   // コンテンツを抽出
   private extractContent(contentArray: any[]): string {
-    if (!Array.isArray(contentArray)) return "[No content]";
+    if (!Array.isArray(contentArray)) return "";
     let contentText = "";
     for (const contentPart of contentArray) {
       if (contentPart.type === "text" && contentPart.text) {
@@ -958,7 +972,7 @@ class RealtimeChat {
         contentText += contentPart.transcript;
       }
     }
-    return contentText || "[No content]";
+    return contentText || "";
   }
 
   // オーディオ再生を停止
@@ -988,9 +1002,15 @@ class RealtimeChat {
         `${role}が関数 ${message.function_name} を呼び出しました。引数: ${content}`
       );
     } else if (message.type === "function_call_output") {
-      console.log(`関数 ${message.function_name} の戻り値: ${content}`);
+      console.log(
+        `関数 ${message.function_name} の戻り値: ${
+          content.slice(0, 50) + content.length > 50 ? "..." : ""
+        }`
+      );
     } else {
-      console.log(`${role}: ${content}`);
+      if (content) {
+        console.log(`${role}: ${content}`);
+      }
     }
     // 最後にログを出力したインデックスを更新
     this.lastLoggedIndex = this.conversationHistory.length;
